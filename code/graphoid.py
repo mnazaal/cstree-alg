@@ -49,7 +49,6 @@ def specialization(csi_rel, val_dict, csi_rels, pairwise=True):
     else:
         raise NotImplementedError("Implement specialization for non pairwise case")
     return new_rels
-                
 
 
 def weak_union(csi_rel, pairwise=True):
