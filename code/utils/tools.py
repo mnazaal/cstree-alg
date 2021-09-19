@@ -8,6 +8,8 @@ import networkx as nx
 import numpy as np
 from scipy.stats import epps_singleton_2samp,anderson_ksamp
 
+vars_of_context = lambda context:  [] if context==[()] else  [var for (var,val) in context] 
+
 
 def test_skl_divergence(sample1, sample2,
                    outcomes,
