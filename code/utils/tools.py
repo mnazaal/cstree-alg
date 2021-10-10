@@ -8,7 +8,8 @@ import networkx as nx
 import numpy as np
 from scipy.stats import epps_singleton_2samp,anderson_ksamp
 
-vars_of_context = lambda context:  [] if context==[()] else  [var for (var,val) in context] 
+
+vars_of_context = lambda context:  [] if context==() else  [var for (var,val) in context] 
 
 
 def test_skl_divergence(sample1, sample2,
@@ -77,8 +78,26 @@ def criteria_bic(tree_object, tree, order):
 # binary, ternary, random ints, one dict with 1 value
 binary_dict  = lambda p: {i+1:[0,1] for i in range(p)}
 ternary_dict = lambda p: {i+1:[0,1,2] for i in range(p)}
-mixed_dict   = lambda p: {i+1:[0,1] if i < p//2 else [0,1,2] for i in range(p)}
+mixed_dict   = lambda p: {i+1:[0,1] if i < p//2 else [0,1,2] for i in srange(p)}
 # CSI relations
+
+def generate_dag1(nodes, p_edge):
+    # Generate random DAG by first generating
+    # fully connected DAG
+    full_dag = nx.complete_graph(nodes, nx.DiGraph())
+    to_remove=[]
+    for u,v in full_dag.edges:
+        r = np.random.uniform()
+        if r>p_edge:
+            to_remove.append((u,v))
+            to_remove.append((v,u))
+        if u>v:
+            # to ensure ordering
+            to_remove.append((u,v))
+    full_dag.remove_edges_from(to_remove)
+    full_dag = nx.relabel_nodes(full_dag, lambda x: x+1)
+    return full_dag
+
 
 def generate_dag(nodes, p_edge):
     rand_graph = nx.gnp_random_graph(nodes,p_edge,directed=True)

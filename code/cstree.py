@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from networkx.drawing.nx_agraph import graphviz_layout
 from gsq.ci_tests import ci_test_dis, ci_test_bin
 
-from .utils.tools import generate_vals, parents, data_to_contexts, remove_cycles, cpdag_to_dags, dag_to_cpdag, generate_dag, coming_in, v_structure, data_to_contexts, vars_of_context
+from .utils.tools import generate_vals, parents, data_to_contexts, remove_cycles, cpdag_to_dags, dag_to_cpdag, generate_dag, generate_dag1, coming_in, v_structure, data_to_contexts, vars_of_context
 from .utils.pc import estimate_cpdag, estimate_skeleton
 from .mincontexts import minimal_context_dags
 from .graphoid import graphoid_axioms
@@ -115,17 +115,27 @@ class CStree(object):
             
 
         """
-        n, p = data.shape
         # Compute contingency table if it doesnt exist
         if self.contingency_table is None:
-            sizes = list(self.value_dict.values())
-            u_shape = tuple(len(sizes[i]) for i in range(p))
-            self.contingency_table = np.zeros(u_shape)
-            for i in range(n):
-                sample = tuple(data[i,:])
-                self.contingency_table[sample] +=1
+            self.contingency_table = self.generate_contingency_table(data)
 
         return self.contingency_table
+
+    
+    def generate_contingency_table(self, data):
+        """ Takes a dataset and returns a contingency table. Assumes
+             the dataset has outcomes starting from 0 for each variable.
+
+        """
+        n, p = data.shape
+        sizes = list(self.value_dict.values())
+        u_shape = tuple(len(sizes[i]) for i in range(p))
+        table= np.zeros(u_shape)
+        for i in range(n):
+            sample = tuple(data[i,:])
+            table[sample] +=1
+        return table
+        
 
     def likelihood(self, x, order, tree, data):
         """ Compute likelihood of the sample x given the staging of the tree and
@@ -501,12 +511,44 @@ class CStree(object):
                 prs.append(pr)
 
         # Final check to make sure all outcomes sum to 1
-        print("All probabilities sum to ",sum(prs))
+        # print("All probabilities sum to ",sum(prs))
         return tree_distr
+
+    def samples_to_distr(self, data):
         
-        
-    def random_hsbm(self, k, order, ps):
-        """ Construct a random Hypothesis-Specific Bayesian Multinet (HSBM).
+        n, p = data.shape
+        cardinalities = [len(self.value_dict[i]) for i in order]
+        tree_distr = DiscreteFactor(["X"+str(i) for i in order],
+                                cardinalities,
+                                np.ones(np.prod(cardinalities))/np.prod(cardinalities))
+        for i in range(n):
+            sample = data[i,:]
+            
+        contingency_table = self.generate_contingency_table(data)
+
+        all_outcomes = product(*list(self.value_dict.values()))
+        for outcome in all_outcomes:
+            prob = float(contingency_table[outcome])/n
+            kwargs = {"X"+str(i):val for i,val in zip(range(1,p+1),list(outcome))}
+            tree_distr.set_value(pr, **kwargs)
+            
+        return tree_distr
+
+    def hsbm_dags(self, order, k, ps):
+        # Generate k random DAGs for HSBM where the first
+        # variable in the order is contains the minimal contexts
+        dags = []
+        for i in range(k):
+            dag = generate_dag1(self.p-1, ps[i])
+            dag = nx.relabel_nodes(dag, lambda i: order[1:][i-1])
+            assert order[1:] in list(nx.all_topological_sorts(dag))
+            dags.append(dag)
+        return dags
+
+    
+    def generate_hsbm(self, order, k, dags):
+        """ Construct a Hypothesis-Specific Bayesian Multinet (HSBM)
+        from the list of DAGs
 
         This is done by generating a DAG model for each of the outcomes of the 
         first variable, which is k
@@ -533,12 +575,16 @@ class CStree(object):
         # For k^th outcome in first variable, create a CStree for a random
         # DAG and connect the root of it to leaf corresponding to k^th outcome
         for i in range(k):
-            dag = generate_dag(self.p-1, ps[i])
-            dag = nx.relabel_nodes(dag, lambda i: order[1:][i-1])
-            assert order[1:] in list(nx.all_topological_sorts(dag))
+            # Generate a random dag with p-1 nodes where a probability
+            # of an edge occuring is ps[i]
+            dag = dags[i]
+
+            # Create the CStree for the random DAG above
             dag_cstree = self.dag_model(dag, order[1:])
 
             for node in dag_cstree:
+                # Attach the CStree for the DAG to the CStree
+                # for the HSBM
                 if node == "Root":
                     continue
                 actual_node = ((order[0], i),)+node
@@ -550,9 +596,13 @@ class CStree(object):
 
             ss+=self.num_stages(dag_cstree)
 
-
         tree_distr = self.tree_distribution(tree, order)
         return tree, tree_distr
+
+    def random_hsbm(self, k, order, ps):
+        dags = self.hsbm_dags(order, k, ps)
+        tree, distr = self.generate_hsbm(order, k, dags)
+        return tree, distr, dags
 
     
     def nonsingleton_stages(self, tree, nodes):
@@ -684,114 +734,253 @@ class CStree(object):
                 merge=False
         return merge
 
+
+    def learn_obs_mcunknown(self, dag, order, use_nodes, node_ratios, data, csi_test,
+                            context_limit, oracle):
+        cstree = self.dag_model(dag, order)
+        skipped=0
+
+        # This loop can be parallelized, since
+        # the independence tests do not depend
+        # on the level
+        for level in range(1, self.p):
+            # The variable for the next level
+            var = order[level]
+            # TODO name this current_level_nodes
+            nodes_l = [n for n in cstree.nodes
+                    if nx.shortest_path_length(cstree, "Root", n) == level]
+
+            # We test using 2 ways
+            # 1) Pairwise node testing
+            # 1a) All combinations of nodes
+            if use_nodes:
+                if node_ratios:
+                    # Select a random subset of nodes to run tests on
+                    nodes_l = random.sample(nodes_l, int(node_ratios[level-1]*len(nodes_l))) # 
+                #else:
+                    # Select all nodes to run tests on
+                nodes_to_compare = combinations(nodes_l, 2)
+
+                for n1,n2 in nodes_to_compare:
+                    context_n1 = cstree.nodes[n1].get("context", n1)
+                    context_n2 = cstree.nodes[n2].get("context", n2)
+
+                    if context_n1 == context_n2:
+                        # If the nodes have the same stage we skip testing them
+                        skipped+=1
+                        continue
+                    else:
+                        # If the nodes have different stages we attempt to merge them
+                        merge = self.node_based_test(data,
+                                                     context_n1, context_n2,
+                                                     var, order, csi_test, oracle)
+                        if merge:
+                                # Contexts are tuples if they are singleton
+                            common_subcontext = set(context_n1).intersection(set(context_n2))
+                            new_nodes = [n for n in nodes_l
+                                        if common_subcontext.issubset(set(n))]
+
+                            # If there are non-singleton nodes trapped in between
+                            # we need to get the common context of them and the
+                            # new common context we just learnt about
+                            existing_contexts = self.nonsingleton_stages(cstree, new_nodes)
+
+                            # If we do have such contexts, we get the new common context
+                            if existing_contexts!=set():
+                                common_subcontext = common_subcontext.intersection(*list(existing_contexts))
+                                new_nodes = [n for n in nodes_l
+                                            if common_subcontext.issubset(set(n))]
+                            for node in new_nodes:
+                                cstree.nodes[node]["context"]=frozenset(common_subcontext)
+            else:
+                # If we use contexts instead of nodes
+                if context_limit is None:
+                    context_size_current_level = level
+                else:
+                    context_size_current_level = context_limit[level]+1
+
+                for context_size in range(0, context_size_current_level):
+                # For each context var size from 0 inclusive
+
+                    # TODO Check if level is good to use or level+1 in line below
+                    B = order[:level] # B in X_A _||_ X_B | X_C=x_c, note that A={var}
+                    contexts = self.generate_contexts(B, context_size)
+
+                    for context in contexts:
+                        merge = self.context_based_test(data, context, var, order, oracle, B, level)
+
+                        if merge:                                    
+                            new_nodes = [n for n in nodes_l
+                                        if set(context).issubset(set(n))]
+
+                            # If there are non-singleton nodes trapped in between
+                            # we need to get the common context of them and the
+                            # new common context we just learnt about
+                            existing_contexts = self.nonsingleton_stages(cstree, new_nodes)
+
+                            # If we do have such contexts, we get the new common context
+                            if existing_contexts!=set():
+                                context = set(context).intersection(*list(existing_contexts))
+                                new_nodes = [n for n in nodes_l
+                                            if context.issubset(set(n))]
+                            for node in new_nodes:
+                                cstree.nodes[node]["context"]=frozenset(context)
+        return cstree
+
+                                        
+
     
-    def learn_obs_mcknown(self, data, minimal_contexts, orders):
+    def learn_obs_mcknown(self, data, minimal_contexts, orders, max_degree=None, oracle=None):
         minimal_context_dags = []
         m = len(minimal_contexts)
-        for mc in minimal_contexts:
-            if mc == [()]:
-                mc = ()
+
+        if max_degree is not None:
+            print(max_degree, minimal_contexts)
+            assert len(max_degree)==len(minimal_contexts)
+        
+        for d, mc in enumerate(minimal_contexts):
             ci_rels = []
             C       = vars_of_context(mc)
             vars    = [i+1 for i in range(self.p) if i+1 not in C] #[p]\C
-            print(C,vars)
             dag     = nx.complete_graph(vars)
 
-            # Loop below is MaxDegree in overleaf
+            if max_degree is None:
+                edge_limit = len(vars)
+            else:
+                edge_limit = max_degree(d)
 
-            for j in range(len(vars)+1):
+            # Loop below is MaxDegree in overleaf
+            for j in range(edge_limit): # This j is the l in Line 4,5 psuedocode
                 for k,l in dag.edges:
                     neighbors = list(set(list(dag.neighbors(k))).difference({k,l}))
                     if len(neighbors)>=j:
                         subsets = [set(i) for i in combinations(neighbors, j)]
                         for subset in subsets:
                             z_subset = set(i-1 for i in subset)
-                        #zero_indexed_subsets = [set([i-1 for i in s]) for s in subsets]
-                        #for z_subset in zero_indexed_subsets:
+                            # This subset contains variables starting from 0
+                            # since the CI test package needs it that way
+
+                            if oracle:
+                                subset = list(subset)
+                                indep=True
+                                contexts = generate_vals(subset, self.value_dict)
+                                for context in contexts:
+                                    distribution_copy = oracle.copy()
+                                    
+                                    vars_to_marginalize = [v for v in vars if v not in [k,l]+vars_of_context(context)]+C
+                                    vars_to_marginalize = ["X"+str(var)
+                                      for var in vars_to_marginalize]
+                                    
+                                    distribution_copy.marginalize(vars_to_marginalize)
+                                    context_to_marginalize = [("X"+str(var),val)
+                                      for (var,val) in context]
+                                    distribution_copy.reduce(context_to_marginalize)
+
+                                    rank = np.linalg.matrix_rank(distribution_copy.values)
+                                    
+
+                                    if rank != 1:
+                                        indep=False
+                                        break
 
                             # For the CI testing, we need 0 indexing
                             # TODO Generalize this to use the csi_test argument in this method
                             #print(data_to_contexts(data, mc))
-                            p_val = ci_test_bin(data_to_contexts(data, mc), k-1, l-1, z_subset)
+                            else:
+                                # if not using oracle
+                               
+
+                                p_val = ci_test_bin(data_to_contexts(data, mc), k-1, l-1, z_subset)
+                                if p_val > 0.05:
+                                    indep = True
+                                else:
+                                    indep = False
 
                             #print(mc, "Tested ",k,l,subset, p_val)
                             # TODO put alpha as part of function
 
-                            if p_val > 0.05:
+                            if indep:
 
                                 #print("Removng edge",k,l,p_val)
                                 dag.remove_edges_from([(k,l)])
                                 if ({k},{l}, {i+1 for i in z_subset}) not in ci_rels:
                                     # TODO Maybe try frozen sets here
-                                    ci_rels.append(({k},{l}, {i for i in z_subset}))
+                                    ci_rels.append(({k},{l}, {i+1 for i in z_subset}))
                                 if ({l},{k}, {i+1 for i in z_subset}) not in ci_rels:
-                                    ci_rels.append(({l},{k}, {i for i in z_subset}))
-                            #print(ci_rels)
-            minimal_context_dags.append((mc, nx.DiGraph(dag), ci_rels))
+                                    ci_rels.append(({l},{k}, {i+1 for i in z_subset}))
+                            
+
+            minimal_context_dags.append((mc, dag, ci_rels))
 
 
-        P_edges = set()
-        # Orienting edges and getting a graph P with directed edges
-        for i in range(m):
-            mc, dag_u, ci_rels = minimal_context_dags[i]
-            dag = nx.DiGraph(dag_u)
-            for k,s,l in combinations(list(dag.nodes),3):
-                # Since the DAG is undirected at the moment,
-                # edge direction does not matter
-                if (k,s) in dag_u.edges and (s,l) in dag_u.edges and (l,k) not in dag_u.edges:
-                    for K,L,S in ci_rels:
-                        if {k}==K and {l}==L and s not in S:
-                            if not ((s,k) in P_edges or (s,l) in P_edges):
-
-                                dag.remove_edges_from([(s,k),(s,l)])
-                                P_edges = P_edges.union({(k,s),(l,s)})
-            minimal_context_dags[i] = (mc, dag, ci_rels)
-
-
-
-
-
-        dag_P = nx.DiGraph()
-        dag_P.add_nodes_from([i+1 for i in range(self.p)])
-        dag_P.add_edges_from(list(P_edges))
 
         if orders is None:
+            # If we don't know the order we get it from the DAG P
+            # we construct below
+            
+            P_edges = set()
+            # Orienting edges and getting a graph P with directed edges
+            for i in range(m):
+                mc, dag_u, ci_rels = minimal_context_dags[i]
+                dag = nx.DiGraph(dag_u)
+                for k,s,l in combinations(list(dag.nodes),3):
+                    # Since the DAG dag_u is undirected at the moment,
+                    # edge direction does not matter
+                    if (k,s) in dag_u.edges and (s,l) in dag_u.edges and (l,k) not in dag_u.edges:
+                        for K,L,S in ci_rels:
+                            if {k}==K and {l}==L and s not in S:
+                                dag.remove_edges_from([(s,k),(s,l)])
+                                if not ((s,k) in P_edges or (s,l) in P_edges):
+
+                                    P_edges = P_edges.union({(k,s),(l,s)})
+                minimal_context_dags[i] = (mc, dag, ci_rels)
+
+
+            dag_P = nx.DiGraph()
+            dag_P.add_nodes_from([i+1 for i in range(self.p)])
+            dag_P.add_edges_from(list(P_edges))
+            
             # Maybe call variable below possible orders
             orders = nx.all_topological_sorts(dag_P)
 
-        # Flag for debugging
-        order_found=False
-        for order in orders:
-            if not order_found:
-                minimal_context_dags_ordered = []
-                new_v_struct = False
-                for i in range(m):
-                    mc, dag, ci_rels = minimal_context_dags[i]
+            # Flag for debugging
+            order_found=False
+            for order in orders:
+                if not order_found:
+                    new_v_struct = False
+                    for i in range(m):
+                        mc, dag, ci_rels = minimal_context_dags[i]
 
-                    # edges in the fully connected DAG with this order
-                    # Below line relies on how "combinations" works, namely,
-                    # e.g. given [a,b,c,d] it returns [(a,b),(a,c),(a,d),(b,c),(b,d),(c,d)]
-                    es = [(i,j) for i,j in combinations(order, 2) if i<j]
+                        # edges in the fully connected DAG with this order
+                        # Below line relies on how "combinations" works, namely,
+                        # e.g. given [a,b,c,d] it returns [(a,b),(a,c),(a,d),(b,c),(b,d),(c,d)]
+                        es = [(i,j) for i,j in combinations(order, 2) if i<j]
 
-                    for (u,v) in es:
-                        if (u,v) in dag.edges and (v,u) in dag.edges:
-                            # direct the edge u<->v as u->v by deleting u<-v
-                            dag.remove_edge(v,u)
+                        for (u,v) in es:
+                            if (u,v) in dag.edges and (v,u) in dag.edges:
+                                # direct the edge u<->v as u->v by deleting u<-v
+                                dag.remove_edge(v,u)
 
-                            # check if this introduces a v-structure
-                            edges_in = coming_in((u,v), dag)
+                                # check if this introduces a v-structure
+                                edges_in = coming_in((u,v), dag)
 
-                            # even if we get 1 new v-structure we move on to the next ordering
-                            new_v_struct = any(list(map(lambda e: v_structure((u,v),e,dag), edges_in)))
-                            if new_v_struct:
-                                break
+                                # even if we get 1 new v-structure we move on to the next ordering
+                                new_v_struct = any(list(map(lambda e: v_structure((u,v),e,dag), edges_in)))
+                                if new_v_struct:
+                                    break
 
-                if new_v_struct:
-                    break
-                # if no new vstruct, we choose this ordering
-                # minimal_context_dags_ordered.append((mc, dag))
-                order_found=True
+                    if new_v_struct:
+                        break
+                
+                    # if no new vstruct, we choose this ordering
+                    # minimal_context_dags_ordered.append((mc, dag))
+                    
 
+        else:
+            # Case where we know atleast one ordering
+            order_found=True
+            order=orders[0]
+                   
         if order_found:
             # Since the above code breaks after finding an ordering that
             # is consistent, it is saved in the order variable which we use below
@@ -799,12 +988,16 @@ class CStree(object):
         else:
             print("Order not found")
 
-        for mc, dag, _ in minimal_context_dags:
+        for i in range(m):
+            # TODO Clean this later
+            mc, dag, ci_rels = minimal_context_dags[i]
             dag_edges = list(dag.edges)
             removed=[] # to debug
             for (u,v) in dag_edges:
-
+                # If we have a bi-directional edge, orient it according
+                # to the ordering
                 if (v,u) in dag_edges and (u,v) not in removed and (v,u) not in removed:
+                    #  TODO Check if this if block ever executes
                     order_v, order_u = order.index(v), order.index(u)
                     if order_v<order_u:
                         dag.remove_edge(u,v)
@@ -812,6 +1005,7 @@ class CStree(object):
                     if order_u<order_v:
                         dag.remove_edge(v,u)
                         removed.append((v,u))
+            minimal_context_dags[i] = (mc, nx.DiGraph(list(dag.edges)), ci_rels)
 
         return minimal_context_dags
 
@@ -859,23 +1053,47 @@ class CStree(object):
                         dag_order_pairs.append((dag, order))
         return dag_order_pairs
 
-    def learn_obs(self,
-                  data,
-                  csi_test,
-                  criteria,
-                  use_nodes=True,
-                  node_ratios=None,
-                  context_limit=None,
-                  dag_method=None,
-                  orders=None,
-                  oracle=False,
-                  minimal_contexts=None,
-                  use_dag=False):
+
+    def learn_interventional(self,
+                             data,
+                             csi_test,
+                             criteria,
+                             i_targets,
+                             i_datasets,
+                             use_nodes=True,
+                             node_ratios=None,
+                             context_limit=None,
+                             dag_method=None,
+                             orders=None,
+                             oracle=False,
+                             minimal_contexts=None,
+                             use_dag=False):
+        
+        # generate observational tree
+
+        # For each interventional variable
+        # For each interventional context
+        # Generate the subtree
+        pass
+
+    def learn_observational(self,
+                            data,
+                            csi_test,
+                            criteria,
+                            use_nodes=True,
+                            node_ratios=None,
+                            context_limit=None,
+                            dag_method=None,
+                            orders=None,
+                            oracle=False,
+                            minimal_contexts=None,
+                            use_dag=False,
+                            max_degree=None):
 
         # If we are given the minimal contexts, we learn the minimal context
         # DAGs directly
         if minimal_contexts:
-            minimal_context_dags =  self.learn_obs_mcknown(data, minimal_contexts, orders)
+            minimal_context_dags =  self.learn_obs_mcknown(data, minimal_contexts, orders, max_degree, oracle)
             return minimal_context_dags
             
         else:
@@ -886,99 +1104,12 @@ class CStree(object):
             # is sent.
             dag_order_pairs = self.generate_dag_order_pairs(data, use_dag, dag_method, orders)
 
-            best_score = -1000000000
+            best_score = float('-inf')
             best_cstrees = []
 
             for dag, order in dag_order_pairs:
-                cstree = self.dag_model(dag, order)
-                skipped=0
-
-                # This loop can be parallelized, since
-                # the independence tests do not depend
-                # on the level
-                for level in range(1, self.p):
-                    # The variable for the next level
-                    var = order[level]
-                    # TODO name this current_level_nodes
-                    nodes_l = [n for n in cstree.nodes
-                            if nx.shortest_path_length(cstree, "Root", n) == level]
-
-                    # We test using 2 ways
-                    # 1) Pairwise node testing
-                    # 1a) All combinations of nodes
-                    if use_nodes:
-                        if node_ratios:
-                            # Select a random subset of nodes to run tests on
-                            nodes_l = random.sample(nodes_l, int(node_ratios[level-1]*len(nodes_l))) # 
-                        #else:
-                            # Select all nodes to run tests on
-                        nodes_to_compare = combinations(nodes_l, 2)
-                            
-                        for n1,n2 in nodes_to_compare:
-                            context_n1 = cstree.nodes[n1].get("context", n1)
-                            context_n2 = cstree.nodes[n2].get("context", n2)
-
-                            if context_n1 == context_n2:
-                                # If the nodes have the same stage we skip testing them
-                                skipped+=1
-                                continue
-                            else:
-                                # If the nodes have different stages we attempt to merge them
-                                merge = self.node_based_test(data,
-                                                             context_n1, context_n2,
-                                                             var, order, csi_test, oracle)
-                                if merge:
-                                        # Contexts are tuples if they are singleton
-                                    common_subcontext = set(context_n1).intersection(set(context_n2))
-                                    new_nodes = [n for n in nodes_l
-                                                if common_subcontext.issubset(set(n))]
-
-                                    # If there are non-singleton nodes trapped in between
-                                    # we need to get the common context of them and the
-                                    # new common context we just learnt about
-                                    existing_contexts = self.nonsingleton_stages(cstree, new_nodes)
-
-                                    # If we do have such contexts, we get the new common context
-                                    if existing_contexts!=set():
-                                        common_subcontext = common_subcontext.intersection(*list(existing_contexts))
-                                        new_nodes = [n for n in nodes_l
-                                                    if common_subcontext.issubset(set(n))]
-                                    for node in new_nodes:
-                                        cstree.nodes[node]["context"]=frozenset(common_subcontext)
-                    else:
-                        # If we use contexts instead of nodes
-                        if context_limit is None:
-                            context_size_current_level = level
-                        else:
-                            context_size_current_level = context_limit[level]+1
-                            
-                        for context_size in range(0, context_size_current_level):
-                        # For each context var size from 0 inclusive
-        
-                            # TODO Check if level is good to use or level+1 in line below
-                            B = order[:level] # B in X_A _||_ X_B | X_C=x_c, note that A={var}
-                            contexts = self.generate_contexts(B, context_size)
-                            
-                            for context in contexts:
-                                merge = self.context_based_test(data, context, var, order, oracle, B, level)
-
-                                if merge:                                    
-                                    new_nodes = [n for n in nodes_l
-                                                if set(context).issubset(set(n))]
-
-                                    # If there are non-singleton nodes trapped in between
-                                    # we need to get the common context of them and the
-                                    # new common context we just learnt about
-                                    existing_contexts = self.nonsingleton_stages(cstree, new_nodes)
-
-                                    # If we do have such contexts, we get the new common context
-                                    if existing_contexts!=set():
-                                        context = set(context).intersection(*list(existing_contexts))
-                                        new_nodes = [n for n in nodes_l
-                                                    if context.issubset(set(n))]
-                                    for node in new_nodes:
-                                        cstree.nodes[node]["context"]=frozenset(context)
-                                    
+                cstree = self.learn_obs_mcunknown(dag, order, use_nodes, node_ratios, data, csi_test,
+                            context_limit, oracle)          
                                         
                 # select best trees and order based on criteria
                 assert criteria in ["bic", "minstages"]
@@ -1008,7 +1139,7 @@ class CStree(object):
 
     
     def visualize(self, tree, order, height_limit=10, colors=None, plot_mcdags=False, save_dir=None):
-        """ 
+        """ Plot a CStree alongside the minimal context DAGs if required
 
         """
 
