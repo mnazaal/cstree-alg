@@ -2,6 +2,7 @@
 import sys
 from functools import reduce
 from itertools import product, combinations
+import random
 
 # Third-party library imports
 import networkx as nx
@@ -9,12 +10,27 @@ import numpy as np
 from scipy.stats import epps_singleton_2samp,anderson_ksamp
 
 
-vars_of_context = lambda context:  [] if context==() else  [var for (var,val) in context] 
+vars_of_context = lambda context: [] if context==() else  [var for (var,_) in context]
 
+
+def reservoir_sample(iterable, n):
+    # From https://stackoverflow.com/questions/2612648/reservoir-sampling
+    """
+    Returns @param n random items from @param iterable.
+    """
+    reservoir = []
+    for t, item in enumerate(iterable):
+        if t < n:
+            reservoir.append(item)
+        else:
+            m = random.randint(0,t)
+            if m < n:
+                reservoir[m] = item
+    return reservoir
 
 def test_skl_divergence(sample1, sample2,
                    outcomes,
-                   threshold,
+                   threshold=1e-2,
                    epsilon=1e-50):
     if len(sample1)>0 and len(sample2)>0:
         distr1 =  [list(sample1).count(i)/len(sample1)
@@ -42,7 +58,7 @@ def test_skl_divergence(sample1, sample2,
         
     
 
-def test_anderson_k(sample1, sample2, outcomes, p):
+def test_anderson_k(sample1, sample2, outcomes, p=0.01):
     try:
         _, _, actual_p = anderson_ksamp([sample1, sample2])
         if actual_p>p:
@@ -53,7 +69,7 @@ def test_anderson_k(sample1, sample2, outcomes, p):
         return False
 
 
-def test_epps(sample1, sample2, outcomes, p):
+def test_epps(sample1, sample2, outcomes, p=0.01):
     try:
         _, actual_p = epps_singleton_2samp(sample1,sample2)
         if actual_p>p or actual_p is float("NaN"):
@@ -206,13 +222,16 @@ def directed(es):
     all_u_es = u_es+[(y,x) for (x,y) in u_es]
     return [d_e for d_e in es if d_e not in all_u_es]
 
-def remove_cycles(g):
+def remove_cycles(g, count_undirected=True):
     cycles_removed=False
     while not cycles_removed:
         try:
             cycles =list(nx.simple_cycles(g))
             # undirected edges do not count as a cycle
-            cycles = [cycle for cycle in cycles if len(cycle)>2]
+            if count_undirected:
+                cycles = [cycle for cycle in cycles if len(cycle)>=2]
+            else:
+                cycles = [cycle for cycle in cycles if len(cycle)>2]
             
             for cycle in cycles:
                 edges_to_remove = [(cycles[i][-1],cycles[i][0]) for i in range(len(cycles))]
@@ -314,6 +333,32 @@ def dag_to_cpdag1(g):
                 pass
     return dag
 
+def P_dag_to_dags(g):
+    undirected_edges = undirected(g.edges)
+    directed_edges   = directed(g.edges)
+    print(undirected_edges)
+
+    def list_powerset2(lst):
+        return reduce(lambda result, x: result + [subset + [x] for subset in result],
+                  lst, [[]])
+    all_dags=[]
+    subsets = list_powerset2(list(undirected_edges))
+    for subset in subsets:
+        dag = nx.DiGraph()
+        dag.add_nodes_from(list(g.nodes))
+        not_included = [e for e in undirected_edges if e not in subset]
+        other_direction = [(v,u) for u,v in not_included]
+        dag.add_edges_from(list(subset)+other_direction+directed_edges)
+        all_dags.append(dag)
+        try:
+            cycles =list(nx.simple_cycles(dag))
+            print("cycls",cycles,list(dag.edges))
+            if len(cycles)!=0:
+                all_dags.pop(-1)
+        except:
+            pass
+           
+    return all_dags
 
 def cpdag_to_dags(g):
     
@@ -321,6 +366,7 @@ def cpdag_to_dags(g):
     directed_edges   = directed(g.edges)
     
     if undirected_edges == []:
+        #print("ha")
         try:
             cycles =list(nx.simple_cycles(g))
             if len(cycles)==0:
@@ -338,6 +384,7 @@ def cpdag_to_dags(g):
         
         # TODO Generator here
         connected_u1 = coming_in(u1,g)
+       
 
         # Filter the edges which were originally directed in the CPDAG
         

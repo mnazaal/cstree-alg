@@ -1,3 +1,4 @@
+from code.cstree_func import all_mec_dags
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -9,7 +10,7 @@ import matplotlib.pyplot as plt
 from networkx.drawing.nx_agraph import graphviz_layout
 from gsq.ci_tests import ci_test_dis, ci_test_bin
 
-from .utils.tools import generate_vals, parents, data_to_contexts, remove_cycles, cpdag_to_dags, dag_to_cpdag, generate_dag, generate_dag1, coming_in, v_structure, data_to_contexts, vars_of_context
+from .utils.tools import generate_vals, parents, data_to_contexts, remove_cycles, cpdag_to_dags, dag_to_cpdag, generate_dag, generate_dag1, coming_in, v_structure, data_to_contexts, vars_of_context,P_dag_to_dags
 from .utils.pc import estimate_cpdag, estimate_skeleton
 from .mincontexts import minimal_context_dags
 from .graphoid import graphoid_axioms
@@ -30,7 +31,7 @@ class DAG(object):
         if method == "pcpgmpy":
             cpdag_model = PC(pd.DataFrame(data, columns=[i+1 for i in range(p)]))
             cpdag_pgmpy = cpdag_model.estimate(return_type="cpdag", show_progress=False)
-            cpdag = nx.DiGraph()
+            cpdag = nx.DiGraph() 
             cpdag.add_nodes_from([i+1 for i in range(p)])
             cpdag.add_edges_from(list(cpdag_pgmpy.edges()))
             cpdag= remove_cycles(cpdag)
@@ -38,8 +39,7 @@ class DAG(object):
         if method=="pcgithub":
             # If the data is binary we do a different test in the PC algorithm
             # binary_data = True if all(list(map(lambda f: True if len(f)==2 else False, list(self.val_dict.values())))) else False
-            binary_data = True if all([True if len(np.unique(data[:,i]))==2 else False for
-                                     i in range(p)]) else False
+            binary_data = True if all([True if len(np.unique(data[:,i]))==2 else False for i in range(p)]) else False
 
         # Set the test to get CPDAG
             if binary_data:
@@ -231,7 +231,7 @@ class CStree(object):
         """
         
         csi_rels = []
-        for level in range(1, self.p+1):
+        for level in range(1, self.p):
             X_k = {order[level]}
             # TODO Test when context is empty
             for context in stages[level]:
@@ -444,9 +444,12 @@ class CStree(object):
 
         first_var_outcomes  = len(self.value_dict[order[0]])
         
-        first_probabilities = np.random.dirichlet(
-            [10*first_var_outcomes if np.random.rand()<0.5
-             else 0.5*first_var_outcomes for _ in range(first_var_outcomes)])
+        #first_probabilities = np.random.dirichlet(
+        #    [10*first_var_outcomes if np.random.rand()<0.5
+        #     else 0.5*first_var_outcomes for _ in range(first_var_outcomes)])
+        #print(first_probabilities)
+        first_probabilities = (1/first_var_outcomes)*np.ones(first_var_outcomes)
+        first_probabilities = np.random.dirichlet([np.random.randint(1,5) for _ in range (first_var_outcomes)])
 
         # Gathering all probabilities to see if they sum to 1
         prs = []
@@ -494,6 +497,7 @@ class CStree(object):
                     if distrs.get((level, context), None) is None:
                         alpha = [10 if np.random.rand()<0.5
                                  else 0.5 for _ in range(outcomes)]
+                        alpha = [np.random.randint(1,5) for _ in range(outcomes)]
                         distrs[(level, context)]=np.random.dirichlet(alpha)
                     # We need the next outcome value of the path
                     # First -1 gets the last node in the current path
@@ -647,11 +651,20 @@ class CStree(object):
         """
         numerator    = self.likelihood(sample, order, tree, data)
         order_of_var = order.index(i)
-        samples      = [np.array(list(sample[:order_of_var])+[val]+list(sample[order_of_var+1:]))
+        samples      = [np.array(list(sample[:order_of_var].copy())+[val]+list(sample[order_of_var+1:].copy()))
                         for val in self.value_dict[i]]
-        # sum_j P(X1=x1,...,Xi-1=xi-1,Xi+1=xi+1,...,Xn|Xi=j)P(Xi=j)
+        # sum_j P(X1=x1,...,Xi-1=xi-1,Xi=j,Xi+1=xi+1,...,Xn)
         denominator  = sum([self.likelihood(s, order, tree, data) for s in samples])
         return numerator/denominator
+
+
+    def indep_b(self, m, tol):
+        r1 = np.abs(m[0,0]-(m[0,0]+m[1,0])*(m[0,0]+m[0,1]))<tol
+        r2 = np.abs(m[0,1]-(m[0,0]+m[0,1])*(m[0,1]+m[1,1]))<tol
+        r3 = np.abs(m[1,0]-(m[0,0]+m[1,0])*(m[1,0]*m[1,1]))<tol
+        r4 = np.abs(m[1,1]-(m[1,0]+m[1,1])*(m[0,1]+m[1,1]))<tol
+        return r1 and r2 and r3 and r4
+        
 
 
     def node_based_test(self, data, context_n1, context_n2, var, order, csi_test, oracle):
@@ -836,22 +849,21 @@ class CStree(object):
 
         if max_degree is not None:
             print(max_degree, minimal_contexts)
-            assert len(max_degree)==len(minimal_contexts)
         
         for d, mc in enumerate(minimal_contexts):
             ci_rels = []
             C       = vars_of_context(mc)
             vars    = [i+1 for i in range(self.p) if i+1 not in C] #[p]\C
-            dag     = nx.complete_graph(vars)
+            dag     = nx.complete_graph(vars) # this is an undirected graph
 
             if max_degree is None:
-                edge_limit = len(vars)
+                edge_limit = len(vars)-len(vars_of_context(mc))
             else:
-                edge_limit = max_degree(d)
+                edge_limit = max_degree[d]
 
             # Loop below is MaxDegree in overleaf
             for j in range(edge_limit): # This j is the l in Line 4,5 psuedocode
-                for k,l in dag.edges:
+                for k,l in dag.edges: # undirected edge
                     neighbors = list(set(list(dag.neighbors(k))).difference({k,l}))
                     if len(neighbors)>=j:
                         subsets = [set(i) for i in combinations(neighbors, j)]
@@ -877,21 +889,33 @@ class CStree(object):
                                     distribution_copy.reduce(context_to_marginalize)
 
                                     rank = np.linalg.matrix_rank(distribution_copy.values)
-                                    
+                                    _, s, _=np.linalg.svd(distribution_copy.values)
+                                    #print(s)
+                                    if  s[-1]< 1e-5:
+                                        ppp=1
+                                        #print(k,l)
 
-                                    if rank != 1:
-                                        indep=False
+                                    
+                                    
+                                    tol=0.1
+                                    indep=self.indep_b(distribution_copy.values, tol)
+                                    if indep==False:
                                         break
+                                    #if rank!=1:
+                                    #    indep=False
+                                    #    break
 
                             # For the CI testing, we need 0 indexing
                             # TODO Generalize this to use the csi_test argument in this method
                             #print(data_to_contexts(data, mc))
                             else:
                                 # if not using oracle
-                               
-
+                                #binary_data = True if all([True if len(np.unique(data[:,i]))==2 else False for i in range(p)]) else False
+                                #if binary_data:
                                 p_val = ci_test_bin(data_to_contexts(data, mc), k-1, l-1, z_subset)
-                                if p_val > 0.05:
+                                #else:
+                                #    p_val = ci_test_dis(data_to_contexts(data, mc), k-1, l-1, z_subset)
+                                if p_val > 0.01:
                                     indep = True
                                 else:
                                     indep = False
@@ -902,12 +926,12 @@ class CStree(object):
                             if indep:
 
                                 #print("Removng edge",k,l,p_val)
-                                dag.remove_edges_from([(k,l)])
-                                if ({k},{l}, {i+1 for i in z_subset}) not in ci_rels:
+                                dag.remove_edges_from([(k,l)]) # removing undircted edge
+                                if ({k},{l}, subset) not in ci_rels:
                                     # TODO Maybe try frozen sets here
-                                    ci_rels.append(({k},{l}, {i+1 for i in z_subset}))
-                                if ({l},{k}, {i+1 for i in z_subset}) not in ci_rels:
-                                    ci_rels.append(({l},{k}, {i+1 for i in z_subset}))
+                                    ci_rels.append(({k},{l}, subset))
+                                #if ({l},{k}, {i+1 for i in z_subset}) not in ci_rels:
+                                #    ci_rels.append(({l},{k}, {i+1 for i in z_subset}))
                             
 
             minimal_context_dags.append((mc, dag, ci_rels))
@@ -918,29 +942,71 @@ class CStree(object):
             # If we don't know the order we get it from the DAG P
             # we construct below
             
-            P_edges = set()
+            P_edges=set()
             # Orienting edges and getting a graph P with directed edges
             for i in range(m):
+                P_edges = set()
                 mc, dag_u, ci_rels = minimal_context_dags[i]
                 dag = nx.DiGraph(dag_u)
-                for k,s,l in combinations(list(dag.nodes),3):
+                #for k,s,l in combinations(list(dag_u.nodes),3):
+                #print("mc ugraph",list(dag_u.edges), "cci",ci_rels)
+                for e1,e2 in combinations(list(dag_u.edges),2):
+                    
                     # Since the DAG dag_u is undirected at the moment,
                     # edge direction does not matter
-                    if (k,s) in dag_u.edges and (s,l) in dag_u.edges and (l,k) not in dag_u.edges:
+                    s = set(e1).intersection(e2)
+                    if len(s)==1:
+                        #print(e1,e2,s)
+                        k=set(e1).difference(s).pop()
+                        l=set(e2).difference(s).pop()
                         for K,L,S in ci_rels:
-                            if {k}==K and {l}==L and s not in S:
-                                dag.remove_edges_from([(s,k),(s,l)])
-                                if not ((s,k) in P_edges or (s,l) in P_edges):
+                            if not s.issubset(S):
+                                if (({k}==K and {l}==L)):
+                                    s1=s.pop()
+                                    dag.remove_edges_from([(s1,k),(s1,l)])
+                                    if (s1,k) not in P_edges and (s1,l) not in P_edges :
+                                        P = nx.DiGraph(list(P_edges))
+                                        P.add_edges_from([(k,s1),(l,s1)])
+                                        if len(list(nx.simple_cycles(P)))==0:
+                                            P_edges = P_edges.union({(k,s1)})
+                                            P_edges = P_edges.union({(l,s1)})
+                                        
 
-                                    P_edges = P_edges.union({(k,s),(l,s)})
+                    
+                    #if (k,s) in dag_u.edges and (s,l) in dag_u.edges and (l,k) not in dag_u.edges:
+                       # for K,L,S in ci_rels:
+                         #   if (({k}==K and {l}==L) or ({k}==L and {l}==K)) and s not in S:
+                            #    dag.remove_edges_from([(s,k),(s,l)])
+                             #   if not ((s,k) in P_edges or (s,l) in P_edges):
+                               #     P_edges = P_edges.union({(k,s),(l,s)})
                 minimal_context_dags[i] = (mc, dag, ci_rels)
 
 
+                
+            #print(list(dag_P.edges))
+            #try:
+            #    cycs = nx.find_cycle(dag_P)
+            #    print("ccycle",cycs, list(dag_u.edges))
+            #except:
+            #    pass
+            
+            #dag_P = remove_cycles(dag_P)
+            #print("after remove", list(dag_P.edges))
+            
+            # Maybe call variable below possible orders
+            #P_MEC = P_dag_to_dags(dag_P)
+           # print(list(dag_P.edges))
+            #orders=[]
+           # for dag in P_MEC:
+           #     print("edges",list(dag.edges))
+           #     orders += nx.all_topological_sorts(dag)
+           # print(len(orders))
+            #orders = nx.all_topological_sorts(all_mec_dags(dag_P))
+            #print(len(list(nx.all_topological_sorts(dag_P))))
             dag_P = nx.DiGraph()
             dag_P.add_nodes_from([i+1 for i in range(self.p)])
             dag_P.add_edges_from(list(P_edges))
             
-            # Maybe call variable below possible orders
             orders = nx.all_topological_sorts(dag_P)
 
             # Flag for debugging
@@ -969,8 +1035,9 @@ class CStree(object):
                                 if new_v_struct:
                                     break
 
-                    if new_v_struct:
-                        break
+                        if new_v_struct:
+                            break
+                    order_found=True
                 
                     # if no new vstruct, we choose this ordering
                     # minimal_context_dags_ordered.append((mc, dag))
@@ -984,9 +1051,10 @@ class CStree(object):
         if order_found:
             # Since the above code breaks after finding an ordering that
             # is consistent, it is saved in the order variable which we use below
-            print("Chosen order ", order)
+            #print("Chosen order ", order)
+            pass
         else:
-            print("Order not found")
+            print("Order not found", order)
 
         for i in range(m):
             # TODO Clean this later
@@ -1005,7 +1073,7 @@ class CStree(object):
                     if order_u<order_v:
                         dag.remove_edge(v,u)
                         removed.append((v,u))
-            minimal_context_dags[i] = (mc, nx.DiGraph(list(dag.edges)), ci_rels)
+            minimal_context_dags[i] = (mc, nx.DiGraph(dag), ci_rels)
 
         return minimal_context_dags
 
